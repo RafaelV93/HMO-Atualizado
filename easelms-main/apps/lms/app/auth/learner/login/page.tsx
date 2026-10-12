@@ -1,0 +1,169 @@
+"use client"
+
+import type React from "react"
+
+import { useState, useEffect } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
+import Link from "next/link"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from "@/components/ui/card"
+import Logo from "@/components/Logo"
+import Indicator from "@/components/Indicator"
+import { AlertCircle, Eye, EyeOff, CheckCircle2 } from "lucide-react"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+
+
+export default function UserLoginPage() {
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [showPassword, setShowPassword] = useState(false)
+  const [error, setError] = useState("")
+  const [loading, setLoading] = useState(false)
+  const [successMessage, setSuccessMessage] = useState("")
+  const router = useRouter()
+  const searchParams = useSearchParams()
+
+  useEffect(() => {
+    if (searchParams.get("reset") === "success") {
+      setSuccessMessage("Your password has been updated. Please sign in with your new password.")
+    }
+  }, [searchParams])
+
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError("")
+    setLoading(true)
+
+    try {
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          email,
+          password,
+          userType: "user",
+        }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        // Show specific error message from API
+        const errorMessage = data.error || "Login failed"
+        setError(errorMessage)
+        
+        // If admin tried to login, redirect to admin login after a short delay
+        if (errorMessage.includes("Admin accounts cannot login")) {
+          setTimeout(() => {
+            router.push("/auth/admin/login")
+          }, 2000)
+        }
+        return
+      }
+
+      // Supabase session is automatically managed via cookies
+      // The useClientAuthState hook will pick up the session automatically
+      // Wait a moment for the session to be established, then redirect
+      setTimeout(() => {
+        router.push("/learner/dashboard")
+      }, 100)
+    } catch (err) {
+      setError("An error occurred. Please try again.")
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="flex justify-center items-center min-h-screen bg-background px-4 sm:px-6 py-6 sm:py-8">
+      <div className="w-full max-w-md space-y-4 sm:space-y-6">
+        <div className="text-center">
+          <Logo className="mx-auto mb-4 sm:mb-6 w-full max-w-[100px] sm:max-w-[120px]" />
+        </div>
+        <Card className="w-full">
+          <CardHeader className="p-4 sm:p-6">
+            <CardTitle className="text-xl sm:text-2xl">Login</CardTitle>
+            <CardDescription className="text-sm sm:text-base">Enter your credentials to access your account</CardDescription>
+          </CardHeader>
+          <form onSubmit={handleSubmit}>
+            <CardContent className="p-4 sm:p-6 pt-0 space-y-4">
+              {successMessage && (
+                <Alert className="text-sm border-green-200 bg-green-50 text-green-900 dark:border-green-900 dark:bg-green-950 dark:text-green-100">
+                  <CheckCircle2 className="h-4 w-4" />
+                  <AlertDescription className="text-xs sm:text-sm">{successMessage}</AlertDescription>
+                </Alert>
+              )}
+              {error && (
+                <Alert variant="destructive" className="text-sm">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription className="text-xs sm:text-sm">{error}</AlertDescription>
+                </Alert>
+              )}
+              <div className="space-y-2">
+                <Label htmlFor="email" className="text-sm sm:text-base">Email</Label>
+                <Input
+                  id="email"
+                  type="email"
+                  placeholder="you@example.com"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  required
+                  className="min-h-[44px] text-sm sm:text-base"
+                />
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <Label htmlFor="password" className="text-sm sm:text-base">Password</Label>
+                  <Link href="/forgot-password" className="text-xs sm:text-sm underline">
+                    Forgot password?
+                  </Link>
+                </div>
+                <div className="relative">
+                  <Input
+                    id="password"
+                    type={showPassword ? "text" : "password"}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    required
+                    className="pr-10 min-h-[44px] text-sm sm:text-base"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent min-w-[44px]"
+                    onClick={() => setShowPassword(!showPassword)}
+                  >
+                    {showPassword ? (
+                      <EyeOff className="h-4 w-4 sm:h-5 sm:w-5 text-muted-foreground" />
+                    ) : (
+                      <Eye className="h-4 w-4 sm:h-5 sm:w-5 text-muted-foreground" />
+                    )}
+                  </Button>
+                </div>
+              </div>
+            </CardContent>
+            <CardFooter className="p-4 sm:p-6 pt-0 flex flex-col space-y-3 sm:space-y-4">
+              <Button type="submit" className="w-full min-h-[44px] text-sm sm:text-base" disabled={loading}>
+                {loading ? "Logging in..." : "Login"}
+              </Button>
+              <div className="text-center text-xs sm:text-sm">
+                Don't have an account?{" "}
+                <Link href="/auth/learner/signup" className="text-primary underline">
+                  Sign up
+                </Link>
+              </div>
+            </CardFooter>
+          </form>
+        </Card>
+        <Indicator />
+      </div>
+    </div>
+  )
+}
+

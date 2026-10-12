@@ -1,0 +1,232 @@
+"use client"
+
+import { useState, useEffect } from "react"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Badge } from "@/components/ui/badge"
+import { Trash2, Search, Users, Loader2 } from "lucide-react"
+import { toast } from "sonner"
+import { useClientAuthState } from "@/utils/client-auth"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import { usePlatformUsers, useDeleteUser, type PlatformUser } from "@/lib/react-query/hooks/useUsers"
+import TableSkeleton from "@/components/TableSkeleton"
+
+export default function UserManagement() {
+  const { user, loading: authLoading, userType } = useClientAuthState()
+  const [searchQuery, setSearchQuery] = useState("")
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
+  const [userToDelete, setUserToDelete] = useState<string | null>(null)
+  // Call hook directly - React Query will use cached data instantly if available
+  const { data: usersData, isPending: usersPending, error: usersError } = usePlatformUsers()
+  const deleteUserMutation = useDeleteUser()
+
+  // Don't render if not authenticated or not admin
+  if (authLoading || !user || userType !== "admin") {
+    return null
+  }
+
+  // Always use cached data if available, even during pending state
+  // This prevents flickering when switching tabs
+  const users: PlatformUser[] = (usersData?.users || []).map((user: any) => ({
+    id: user.id,
+    name: user.name || "",
+    email: user.email || "",
+    enrolledCoursesCount: user.enrolledCoursesCount || 0,
+    completedCoursesCount: user.completedCoursesCount || 0,
+    created_at: user.created_at || new Date().toISOString(),
+  }))
+
+  // Check if we have cached data - show data instantly if available
+  // Check if property exists, not length (empty array is still valid cached data)
+  const hasCachedData = usersData?.users !== undefined
+  
+  // Show skeleton ONLY on true initial load (no cached data exists and pending)
+  // Once we have data, never show skeleton again (even during refetches or remounts)
+  // Show cached data instantly even if isPending is true
+  // Never show skeleton if we have any cached data, even if it's an empty array
+  // This prevents flickering when switching tabs
+  const showSkeleton = !hasCachedData && usersPending
+  
+  // Show error only if we have no cached data
+  const error = usersError && !hasCachedData ? (usersError as Error).message : null
+
+  // Note: Suspend/Activate functionality requires a status field in the profiles table
+  // For now, this is commented out until the database schema supports it
+  // const handleSuspendUser = async (id: string) => {
+  //   try {
+  //     setSuspending(id)
+  //     const user = users.find((u) => u.id === id)
+  //     if (!user) return
+
+  //     const newStatus = user.status === "active" ? "suspended" : "active"
+
+  //     const response = await fetch(`/api/users/${id}`, {
+  //       method: "PUT",
+  //       headers: {
+  //         "Content-Type": "application/json",
+  //       },
+  //       body: JSON.stringify({
+  //         status: newStatus,
+  //       }),
+  //     })
+
+  //     if (!response.ok) {
+  //       const errorData = await response.json().catch(() => ({}))
+  //       throw new Error(errorData.error || "Failed to update user status")
+  //     }
+
+  //     setUsers(users.map((u) => (u.id === id ? { ...u, status: newStatus } : u)))
+  //     toast.success(`User ${newStatus === "active" ? "activated" : "suspended"} successfully`)
+  //   } catch (err: any) {
+  //     console.error("Error updating user status:", err)
+  //     toast.error(err.message || "Failed to update user status")
+  //   } finally {
+  //     setSuspending(null)
+  //   }
+  // }
+
+  const handleDeleteClick = (id: string) => {
+    setUserToDelete(id)
+    setDeleteDialogOpen(true)
+  }
+
+  const handleDeleteConfirm = async () => {
+    if (!userToDelete) return
+
+    try {
+      await deleteUserMutation.mutateAsync(userToDelete)
+      toast.success("User deleted successfully")
+      setDeleteDialogOpen(false)
+      setUserToDelete(null)
+    } catch (err: any) {
+      console.error("Error deleting user:", err)
+      toast.error(err.message || "Failed to delete user")
+    }
+  }
+
+  const filteredUsers = users.filter(
+    (user) =>
+      user.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      user.email.toLowerCase().includes(searchQuery.toLowerCase())
+  )
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center">
+          <Users className="mr-2 h-5 w-5" /> User Management
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        {error && (
+          <div className="mb-4 p-4 bg-destructive/10 border border-destructive/20 rounded-lg">
+            <p className="text-sm text-destructive">{error}</p>
+          </div>
+        )}
+        <div className="space-y-4">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-muted-foreground h-4 w-4" />
+            <Input
+              placeholder="Search users by name or email..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="pl-10"
+            />
+          </div>
+        </div>
+        <div className="mt-6">
+          {showSkeleton ? (
+            <TableSkeleton columns={6} rows={5} />
+          ) : filteredUsers.length === 0 ? (
+            <div className="text-center text-muted-foreground py-8">
+              {searchQuery ? "No users found matching your search" : "No users found"}
+            </div>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Name</TableHead>
+                  <TableHead>Email</TableHead>
+                  <TableHead>Enrolled Courses</TableHead>
+                  <TableHead>Completed Courses</TableHead>
+                  <TableHead>Join Date</TableHead>
+                  <TableHead>Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {filteredUsers.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={6} className="text-center text-muted-foreground py-8">
+                      {searchQuery ? "No users found matching your search" : "No users found"}
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  filteredUsers.map((user) => (
+                    <TableRow key={user.id}>
+                      <TableCell className="font-medium">{user.name}</TableCell>
+                      <TableCell>{user.email}</TableCell>
+                      <TableCell>{user.enrolledCoursesCount}</TableCell>
+                      <TableCell>{user.completedCoursesCount}</TableCell>
+                      <TableCell>
+                        {new Date(user.created_at).toLocaleDateString()}
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleDeleteClick(user.id)}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          )}
+        </div>
+
+        <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Are you sure?</AlertDialogTitle>
+              <AlertDialogDescription>
+                This action cannot be undone. This will permanently delete the user and all associated data.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={deleteUserMutation.isPending}>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={handleDeleteConfirm}
+                disabled={deleteUserMutation.isPending}
+                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              >
+                {deleteUserMutation.isPending ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Deleting...
+                  </>
+                ) : (
+                  "Delete"
+                )}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </CardContent>
+    </Card>
+  )
+}
+

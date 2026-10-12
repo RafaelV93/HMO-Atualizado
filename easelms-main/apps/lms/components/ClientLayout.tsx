@@ -1,0 +1,402 @@
+"use client"
+
+import type React from "react"
+import { useState, useEffect, useRef, useMemo } from "react"
+import { usePathname } from "next/navigation"
+import Header from "./Header"
+import LeftSidebar from "./LeftSidebar"
+import MobileMenu from "./MobileMenu"
+import { getClientAuthState, useClientAuthState } from "../utils/client-auth"
+import { ThemeProvider } from "./ThemeProvider"
+import { PageTransition } from "./PageTransition"
+import { createClient, isSupabaseConfigured } from "@/lib/supabase/client"
+import { Toaster } from "@/components/ui/sonner"
+import { QueryProvider } from "@/lib/react-query/QueryProvider"
+import { ErrorBoundary } from "./ErrorBoundary"
+import DynamicTitle from "./DynamicTitle"
+import DynamicFavicon from "./DynamicFavicon"
+import { useQueryClient } from "@tanstack/react-query"
+
+export default function ClientLayout({
+  children,
+  initialSettingsData,
+}: {
+  children: React.ReactNode
+  initialSettingsData?: { platformSettings: any }
+}) {
+  const pathname = usePathname()
+  
+  // Use the hook for Supabase auth if configured, otherwise use state
+  const supabaseAuthState = useClientAuthState()
+  const isSupabase = isSupabaseConfigured()
+  
+  // Initialize auth state - start with false to match server render
+  const [authState, setAuthState] = useState<{ isLoggedIn: boolean; userType?: string; user?: any }>({
+    isLoggedIn: false,
+  })
+  const [mounted, setMounted] = useState(false)
+
+  // Only check auth state on client after mount to avoid hydration mismatch
+  useEffect(() => {
+    setMounted(true)
+    if (typeof window !== "undefined") {
+      if (isSupabase) {
+        // Check if we have a session even if hook is still loading
+        const checkSession = async () => {
+          try {
+            const supabase = createClient()
+            const { data: { session } } = await supabase.auth.getSession()
+
+            if (session?.user) {
+              // If we have a session, use the hook state if available, otherwise fetch profile
+              if (!supabaseAuthState.loading && supabaseAuthState.user) {
+                setAuthState({
+                  isLoggedIn: supabaseAuthState.isLoggedIn,
+                  userType: supabaseAuthState.userType,
+                  user: {
+                    name: supabaseAuthState.user.name || "",
+                    profileImage: supabaseAuthState.user.profileImage || "",
+                    email: supabaseAuthState.user.email || "",
+                    id: supabaseAuthState.user.id,
+                  },
+                })
+              } else {
+                // Hook still loading, but we have a session - fetch profile directly
+                const profileResponse = await fetch("/api/profile")
+                if (profileResponse.ok) {
+                  const profileData = await profileResponse.json()
+                  if (profileData.profile) {
+                    setAuthState({
+                      isLoggedIn: true,
+                      userType: profileData.profile.user_type,
+                      user: {
+                        id: profileData.profile.id,
+                        name: profileData.profile.name || "",
+                        email: profileData.profile.email || "",
+                        profileImage: profileData.profile.profile_image || "",
+                      },
+                    })
+                  }
+                }
+              }
+            } else if (!supabaseAuthState.loading) {
+              // No session and hook finished loading
+              setAuthState({
+                isLoggedIn: false,
+              })
+            }
+          } catch (error) {
+            console.error("Error checking session:", error)
+            // Fallback to hook state or cookies
+            if (!supabaseAuthState.loading && supabaseAuthState.user) {
+              setAuthState({
+                isLoggedIn: supabaseAuthState.isLoggedIn,
+                userType: supabaseAuthState.userType,
+                user: {
+                  name: supabaseAuthState.user.name || "",
+                  profileImage: supabaseAuthState.user.profileImage || "",
+                  email: supabaseAuthState.user.email || "",
+                  id: supabaseAuthState.user.id,
+                },
+              })
+            } else if (!isSupabase) {
+              setAuthState(getClientAuthState())
+            }
+          }
+        }
+
+        checkSession()
+      } else {
+        setAuthState(getClientAuthState())
+      }
+    }
+  }, [isSupabase, supabaseAuthState])
+
+  // Prevent unnecessary auth re-checks when tab becomes visible
+  // This fixes flickering when switching between browser tabs
+  useEffect(() => {
+    if (!mounted || typeof window === "undefined") return
+
+    let isInitialCheck = true
+
+    const handleVisibilityChange = () => {
+      // Skip auth re-check on first visibility change (tab becoming active)
+      // Only allow re-checks after the initial mount to prevent flickering
+      if (isInitialCheck) {
+        isInitialCheck = false
+        return
+      }
+
+      // For subsequent visibility changes, only re-check if we suspect auth state might have changed
+      // This prevents unnecessary API calls and re-renders that cause flickering
+      if (document.visibilityState === "visible") {
+        // Small delay to ensure the tab is fully active before any potential re-checks
+        setTimeout(() => {
+          // Only proceed if component is still mounted and visible
+          if (document.visibilityState === "visible") {
+            // We could add lightweight auth verification here if needed
+            // For now, we prevent the heavy auth re-checks that were causing flickering
+          }
+        }, 100)
+      }
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange)
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange)
+    }
+  }, [mounted])
+
+  // Update auth state when pathname changes (in case user logs in/out or navigates)
+  // Only trigger on actual pathname changes, not on tab visibility changes
+  const prevPathnameRef = useRef(pathname)
+  useEffect(() => {
+    // Only run if pathname actually changed (not just tab becoming visible)
+    if (prevPathnameRef.current === pathname) return
+    prevPathnameRef.current = pathname
+
+    if (mounted && typeof window !== "undefined") {
+      if (isSupabase) {
+        // Check session on pathname change to catch login/logout
+        const checkSession = async () => {
+          try {
+            const supabase = createClient()
+            const { data: { session } } = await supabase.auth.getSession()
+
+            if (session?.user) {
+              if (!supabaseAuthState.loading && supabaseAuthState.user) {
+                setAuthState({
+                  isLoggedIn: supabaseAuthState.isLoggedIn,
+                  userType: supabaseAuthState.userType,
+                  user: {
+                    name: supabaseAuthState.user.name || "",
+                    profileImage: supabaseAuthState.user.profileImage || "",
+                    email: supabaseAuthState.user.email || "",
+                    id: supabaseAuthState.user.id,
+                  },
+                })
+              } else {
+                // Fetch profile if hook hasn't loaded yet
+                const profileResponse = await fetch("/api/profile")
+                if (profileResponse.ok) {
+                  const profileData = await profileResponse.json()
+                  if (profileData.profile) {
+                    setAuthState({
+                      isLoggedIn: true,
+                      userType: profileData.profile.user_type,
+                      user: {
+                        id: profileData.profile.id,
+                        name: profileData.profile.name || "",
+                        email: profileData.profile.email || "",
+                        profileImage: profileData.profile.profile_image || "",
+                      },
+                    })
+                  }
+                }
+              }
+            } else {
+              // No session
+              setAuthState({
+                isLoggedIn: false,
+              })
+            }
+          } catch (error) {
+            console.error("Error checking session on pathname change:", error)
+            if (!supabaseAuthState.loading && supabaseAuthState.user) {
+              setAuthState({
+                isLoggedIn: supabaseAuthState.isLoggedIn,
+                userType: supabaseAuthState.userType,
+                user: {
+                  name: supabaseAuthState.user.name || "",
+                  profileImage: supabaseAuthState.user.profileImage || "",
+                  email: supabaseAuthState.user.email || "",
+                  id: supabaseAuthState.user.id,
+                },
+              })
+            }
+          }
+        }
+
+        checkSession()
+      } else {
+        setAuthState(getClientAuthState())
+      }
+    }
+  }, [pathname, mounted, isSupabase, supabaseAuthState])
+
+  // Listen for profile updates to refresh header
+  useEffect(() => {
+    if (!mounted || typeof window === "undefined") return
+
+    const handleProfileUpdate = async () => {
+      // If using Supabase, refetch profile from database
+      if (isSupabase) {
+        try {
+          const supabase = createClient()
+          const { data: { session } } = await supabase.auth.getSession()
+          if (session?.user) {
+            const { data: profile } = await supabase
+              .from("profiles")
+              .select("*")
+              .eq("id", session.user.id)
+              .single()
+
+            if (profile) {
+              setAuthState({
+                isLoggedIn: true,
+                userType: profile.user_type,
+                user: {
+                  id: profile.id,
+                  name: profile.name || "",
+                  email: profile.email || "",
+                  profileImage: profile.profile_image || "",
+                  currency: profile.currency || "USD",
+                  userType: profile.user_type,
+                },
+              })
+            }
+          }
+        } catch (error) {
+          console.error("Error refreshing profile:", error)
+          // Fallback to cookie-based auth
+          setAuthState(getClientAuthState())
+        }
+      } else {
+        // Refresh from cookies
+        setAuthState(getClientAuthState())
+      }
+    }
+
+    window.addEventListener("profileUpdated", handleProfileUpdate)
+    return () => {
+      window.removeEventListener("profileUpdated", handleProfileUpdate)
+    }
+  }, [mounted, isSupabase])
+
+  // Check if current path is an auth page
+  const { isLoggedIn, userType, user } = authState
+
+  // Memoize derived values to prevent unnecessary re-renders
+  const derivedLayoutValues = useMemo(() => {
+    const isProtectedRoute = pathname.startsWith('/admin/') || pathname.startsWith('/learner/')
+    const isAuthPage = [
+      "/auth/learner/login",
+      "/auth/learner/signup",
+      "/auth/admin/login",
+      "/forgot-password",
+      "/forgot-password/code",
+      "/forgot-password/new-password",
+    ].includes(pathname) || pathname.startsWith("/auth/")
+
+    // Always show layout for protected routes (even if auth is loading)
+    // Page content will handle showing its own skeleton
+    const shouldShowLayout = isProtectedRoute && !isAuthPage
+
+    // Derive userType from pathname if auth state not ready yet
+    const derivedUserType: "user" | "admin" | "instructor" = userType
+      ? (userType as "user" | "admin" | "instructor")
+      : pathname.startsWith('/admin/')
+        ? "admin"
+        : "user"
+
+    return { isProtectedRoute, isAuthPage, shouldShowLayout, derivedUserType }
+  }, [pathname, userType])
+
+  const { shouldShowLayout, derivedUserType } = derivedLayoutValues
+
+  return (
+    <ErrorBoundary>
+      <QueryProvider>
+        <BrandSettingsPrefetcher initialData={initialSettingsData}>
+          <ThemeProvider defaultTheme="dark" storageKey="easelms-theme">
+            <DynamicTitle />
+            <DynamicFavicon />
+            {shouldShowLayout ? (
+              <div className="flex flex-col h-screen">
+                <div className="lg:hidden">
+                  <MobileMenu userType={derivedUserType} user={user} />
+                </div>
+                <div className="hidden lg:flex h-screen">
+                  <LeftSidebar userType={derivedUserType} />
+                  <div className="flex flex-col flex-grow lg:ml-64">
+                    <Header isLoggedIn={isLoggedIn} userType={derivedUserType === "instructor" ? "admin" : derivedUserType} user={user} />
+                    <div className="flex-grow lg:pt-16 pb-8">
+                      <main className="container-fluid">
+                        {children}
+                      </main>
+                    </div>
+                  </div>
+                </div>
+                <div className="lg:hidden flex-grow mt-16 mb-[30px] pb-[30px]">
+                  <main className="container-fluid">
+                    {children}
+                  </main>
+                </div>
+              </div>
+            ) : (
+              <PageTransition>{children}</PageTransition>
+            )}
+            <Toaster />
+          </ThemeProvider>
+        </BrandSettingsPrefetcher>
+      </QueryProvider>
+    </ErrorBoundary>
+  )
+}
+
+// Component to prefetch brand settings on mount to prevent defaults from showing
+function BrandSettingsPrefetcher({ 
+  children, 
+  initialData 
+}: { 
+  children: React.ReactNode
+  initialData?: { platformSettings: any }
+}) {
+  const queryClient = useQueryClient()
+
+  useEffect(() => {
+    // Set initial data from server-side if provided
+    // This ensures data is available immediately on client-side, preventing flicker
+    if (initialData) {
+      queryClient.setQueryData(["settings"], initialData)
+    }
+    
+    // Check if data already exists in cache
+    const cachedData = queryClient.getQueryData<{ platformSettings: any }>(["settings"])
+    
+    // Only prefetch if data doesn't exist in cache AND initialData wasn't provided
+    // This ensures we don't refetch unnecessarily and data is available immediately
+    // Data persists in cache forever (gcTime: Infinity), so we only fetch once
+    if (!cachedData && !initialData) {
+      // Prefetch brand settings immediately on mount to ensure data is available
+      // This prevents defaults from showing even briefly
+      // Use public endpoint that works on auth pages too
+      queryClient.prefetchQuery({
+        queryKey: ["settings"],
+        queryFn: async () => {
+          try {
+            // Try public brand settings endpoint first (works on auth pages)
+            const publicResponse = await fetch("/api/brand-settings")
+            if (publicResponse.ok) {
+              return await publicResponse.json()
+            }
+            // Fallback to authenticated endpoint if public fails
+            const response = await fetch("/api/settings")
+            if (!response.ok) {
+              return { platformSettings: null }
+            }
+            return response.json()
+          } catch (error) {
+            // If fetch fails, return null to use defaults
+            return { platformSettings: null }
+          }
+        },
+        staleTime: Infinity, // Never consider stale
+        gcTime: Infinity, // Keep forever
+      })
+    }
+  }, [queryClient, initialData])
+
+  return <>{children}</>
+}

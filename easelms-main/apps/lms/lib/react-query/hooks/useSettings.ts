@@ -1,0 +1,103 @@
+import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { useAppQuery } from "./useAppCache"
+
+export interface PlatformSettings {
+  default_currency?: string
+  course_enrollment_notifications?: boolean
+  course_completion_notifications?: boolean
+  platform_announcements?: boolean
+  user_email_notifications?: boolean
+  // Brand settings
+  platform_name?: string
+  platform_description?: string
+  logo_black?: string
+  logo_white?: string
+  favicon?: string
+  contact_email?: string
+  app_url?: string
+  seo_title?: string
+  seo_description?: string
+  seo_keywords?: string
+  seo_image?: string
+}
+
+interface SettingsResponse {
+  platformSettings: PlatformSettings | null
+  userSettings?: any
+}
+
+// Fetch platform settings (admin only)
+// Uses useAppQuery for unified caching and localStorage persistence
+export function useSettings() {
+  const result = useAppQuery<SettingsResponse>(
+    'settings',
+    ["settings"],
+    async () => {
+      const response = await fetch("/api/settings")
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.error || "Failed to fetch settings")
+      }
+      return response.json()
+    }
+  )
+  
+  // Note: Settings use 'static' config (15 min staleTime) from cache-config.ts
+  // localStorage persistence ensures instant data display on remount
+  return result
+}
+
+// Update platform settings
+export function useUpdateSettings() {
+  const queryClient = useQueryClient()
+  
+  return useMutation({
+    mutationFn: async (settings: { platformSettings?: PlatformSettings; userSettings?: any }) => {
+      const response = await fetch("/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings),
+      })
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.error || "Failed to update settings")
+      }
+      return response.json()
+    },
+    onSuccess: (data, variables) => {
+      // Update cache immediately with new data instead of invalidating
+      // This prevents flickering to defaults
+      // Merge the new platformSettings with existing data to preserve structure
+      const currentData = queryClient.getQueryData<SettingsResponse>(["settings"])
+      const updatedData: SettingsResponse = {
+        ...currentData,
+        platformSettings: {
+          ...currentData?.platformSettings,
+          ...variables.platformSettings,
+        },
+        userSettings: {
+          ...currentData?.userSettings,
+          ...variables.userSettings,
+        },
+      }
+      queryClient.setQueryData(["settings"], updatedData)
+
+      // Check for invalidation hints from the API response
+      if (data?.invalidationHints?.invalidateAdminStats) {
+        // Invalidate admin stats cache when platform settings change (e.g., currency)
+        queryClient.invalidateQueries({ queryKey: ["admin-stats"] })
+      }
+
+      // DON'T invalidate settings - this causes refetch and flicker
+      // The cache is already updated with the new data
+    },
+  })
+}
+
+// Invalidate settings cache
+export function useInvalidateSettings() {
+  const queryClient = useQueryClient()
+  return () => {
+    queryClient.invalidateQueries({ queryKey: ["settings"] })
+  }
+}

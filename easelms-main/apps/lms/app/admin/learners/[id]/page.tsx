@@ -1,0 +1,566 @@
+"use client"
+
+import { useState, useEffect, useMemo } from "react"
+import { useParams, useRouter } from "next/navigation"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
+import { Badge } from "@/components/ui/badge"
+import { Progress } from "@/components/ui/progress"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import {
+  ArrowLeft,
+  Mail,
+  BookOpen,
+  Award,
+  Calendar,
+  DollarSign,
+  ShoppingBag,
+  XCircle,
+} from "lucide-react"
+import { useClientAuthState } from "@/utils/client-auth"
+import Link from "next/link"
+import { toast } from "sonner"
+import { createCourseSlug } from "@/lib/slug"
+import { formatCurrency } from "@/lib/utils/currency"
+import AdminLearnerDetailSkeleton from "@/components/AdminLearnerDetailSkeleton"
+import { useLearner, useRealtimeAdminStats } from "@/lib/react-query/hooks"
+import { usePageSkeleton } from "@/lib/react-query/hooks/useSkeleton"
+
+interface Learner {
+  id: string
+  name: string
+  email: string
+  profileImage: string
+  bio?: string
+  currency: string
+  enrolledCourses: number[]
+  completedCourses: number[]
+  progress: { [courseId: number]: number }
+  created_at?: string
+}
+
+interface Course {
+  id: number
+  title: string
+  image?: string
+  lessons?: Array<{ id: number; title: string }>
+  enrolledStudents?: number
+  calculatedProgress?: number
+}
+
+interface Purchase {
+  id: string
+  courseId: number
+  courseTitle: string
+  courseImage?: string
+  amount: number
+  currency: string
+  gateway?: string
+  status: string
+  type: "one-time" | "recurring"
+  recurringPrice?: number
+  purchasedAt: string
+  completedAt?: string
+  cancelledAt?: string
+}
+
+function LearnerDetailsPage() {
+  const params = useParams()
+  const router = useRouter()
+  const { user, loading: authLoading, userType } = useClientAuthState()
+  const learnerId = params.id as string
+  const [courses, setCourses] = useState<Course[]>([])
+  const [purchases, setPurchases] = useState<Purchase[]>([])
+
+  // Use React Query hooks for data fetching with caching
+  const { data: learnerData, isPending: learnerPending, error: learnerError } = useLearner(learnerId)
+  
+  // Set up real-time subscription for learners (via admin stats)
+  useRealtimeAdminStats()
+
+  // Process learner data from React Query
+  const learner = useMemo<Learner | null>(() => {
+    if (!learnerData?.learner) return null
+    const l = learnerData.learner
+    return {
+      id: l.id,
+      name: l.name,
+      email: l.email,
+      profileImage: l.profileImage || l.profile_image || "",
+      bio: l.bio,
+      currency: l.currency || "USD",
+      enrolledCourses: l.enrolledCourses || [],
+      completedCourses: l.completedCourses || [],
+      progress: l.progress || {},
+      created_at: l.created_at,
+    }
+  }, [learnerData])
+
+  useEffect(() => {
+    if (!authLoading && (!user || userType !== "admin")) {
+      router.push("/auth/admin/login")
+    }
+  }, [user, userType, authLoading, router])
+
+  useEffect(() => {
+    const fetchCoursesAndProgress = async () => {
+      if (!learner || learner.enrolledCourses.length === 0) {
+        setCourses([])
+        return
+      }
+
+      try {
+        const courseIds = learner.enrolledCourses.join(",")
+        const coursesResponse = await fetch(`/api/courses?ids=${courseIds}`)
+        if (!coursesResponse.ok) {
+          console.warn("Failed to fetch courses, showing basic course info")
+          // Don't throw error, just show basic course info without progress
+          setCourses(learner.enrolledCourses.map(id => ({
+            id,
+            title: `Course ${id}`,
+            calculatedProgress: 0
+          })))
+          return
+        }
+
+        const coursesData = await coursesResponse.json()
+        let coursesList = coursesData.courses || []
+
+        // Try to get progress data, but don't fail if it doesn't work
+        let progressList: any[] = []
+        try {
+          const progressResponse = await fetch(`/api/learners/${learner.id}/progress`)
+          if (progressResponse.ok) {
+            const progressData = await progressResponse.json()
+            progressList = progressData.progress || []
+          }
+        } catch (progressError) {
+          console.warn("Failed to fetch progress data:", progressError)
+          // Continue without progress data
+        }
+
+        const coursesWithProgress = await Promise.all(
+          coursesList.map(async (course: Course) => {
+            let calculatedProgress = 0
+
+            // Try to get detailed course info for progress calculation
+            try {
+              const courseDetailResponse = await fetch(`/api/courses/${course.id}`)
+              if (courseDetailResponse.ok) {
+                const courseDetailData = await courseDetailResponse.json()
+                const fullCourse = courseDetailData.course
+
+                if (fullCourse && Array.isArray(fullCourse.lessons)) {
+                  const lessonsProgress = progressList.filter(
+                    (p) => p.course_id === course.id && p.completed
+                  )
+                  const completedLessonCount = lessonsProgress.length
+                  const totalLessons = fullCourse.lessons.length
+
+                  calculatedProgress = totalLessons > 0
+                    ? Math.round((completedLessonCount / totalLessons) * 100)
+                    : 0
+
+                  return {
+                    ...course,
+                    lessons: fullCourse.lessons,
+                    calculatedProgress,
+                  }
+                }
+              }
+            } catch (detailError) {
+              console.warn(`Failed to fetch course details for ${course.id}:`, detailError)
+            }
+
+            // Fallback: return course with basic progress calculation or 0
+            return {
+              ...course,
+              calculatedProgress,
+            }
+          })
+        )
+
+        setCourses(coursesWithProgress)
+      } catch (err: any) {
+        console.error("Error fetching courses data:", err)
+        // Set basic course data as fallback
+        setCourses(learner.enrolledCourses.map(id => ({
+          id,
+          title: `Course ${id}`,
+          calculatedProgress: 0
+        })))
+      }
+    }
+
+    fetchCoursesAndProgress()
+  }, [learner])
+
+  useEffect(() => {
+    const fetchPurchases = async () => {
+      if (authLoading || !user || !params.id) {
+        setPurchases([])
+        return
+      }
+
+      try {
+        const response = await fetch(`/api/learners/${params.id}/purchases`)
+        if (!response.ok) {
+          console.warn("Failed to fetch purchases, showing empty list")
+          setPurchases([])
+          return
+        }
+
+        const data = await response.json()
+        setPurchases(data.purchases || [])
+      } catch (err: any) {
+        console.error("Error fetching purchases:", err)
+        setPurchases([])
+      }
+    }
+
+    fetchPurchases()
+  }, [params.id, authLoading, user])
+
+  // Use unified skeleton logic - show skeleton only on first load with no cached data
+  const showSkeleton = usePageSkeleton(authLoading, !!user && userType === "admin", [learnerData])
+
+  if (showSkeleton) {
+    return <AdminLearnerDetailSkeleton />
+  }
+
+  if (learnerError || !learner) {
+    return (
+      <div className="pt-4 md:pt-8">
+        <div className="text-center py-8">
+          <p className="text-destructive mb-4">{learnerError?.message || "Learner not found"}</p>
+          <Link href="/admin/learners">
+            <Button variant="outline" className="mt-4">
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back to Learners
+            </Button>
+          </Link>
+        </div>
+      </div>
+    )
+  }
+
+  const getCourseTitle = (courseId: number) => {
+    const course = courses.find((c) => c.id === courseId)
+    return course?.title || `Course ${courseId}`
+  }
+
+  const getCourse = (courseId: number) => {
+    return courses.find((c) => c.id === courseId)
+  }
+
+  const enrolledCourses = learner.enrolledCourses
+    .map((courseId) => getCourse(courseId))
+    .filter((course): course is Course => course !== undefined)
+  
+  const completedCourses = learner.completedCourses
+    .map((courseId) => getCourse(courseId))
+    .filter((course): course is Course => course !== undefined)
+
+  const avgProgress = enrolledCourses.length > 0
+    ? Math.round(
+        (enrolledCourses.reduce((sum, course) => sum + (course.calculatedProgress || 0), 0) /
+          enrolledCourses.length) *
+          10
+      ) / 10
+    : 0
+
+  return (
+    <div className="pt-4 md:pt-8 pb-[30px] md:pb-8 px-4 lg:px-6">
+      <div className="mb-6">
+        <Link href="/admin/learners">
+          <Button variant="ghost" className="mb-4">
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back to Learners
+          </Button>
+        </Link>
+      </div>
+
+      <Card className="mb-6">
+        <CardContent className="pt-6">
+          <div className="flex flex-col md:flex-row items-start md:items-center gap-6">
+            <Avatar className="h-24 w-24">
+              <AvatarImage src={learner.profileImage} alt={learner.name} />
+              <AvatarFallback className="text-2xl">{learner.name.charAt(0)}</AvatarFallback>
+            </Avatar>
+            <div className="flex-1">
+              <div className="flex items-center gap-3 mb-2">
+                <h1 className="text-3xl font-bold">{learner.name}</h1>
+                <Badge variant="secondary">Learner</Badge>
+              </div>
+              <div className="space-y-2 text-sm text-muted-foreground">
+                <div className="flex items-center gap-2">
+                  <Mail className="h-4 w-4" />
+                  <span>{learner.email}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <DollarSign className="h-4 w-4" />
+                  <span>Currency: {learner.currency || "USD"}</span>
+                </div>
+                {learner.created_at && (
+                  <div className="flex items-center gap-2">
+                    <Calendar className="h-4 w-4" />
+                    <span>Joined: {new Date(learner.created_at).toLocaleDateString()}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center">
+              <BookOpen className="mr-2 h-4 w-4" />
+              Enrolled Courses
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">{learner.enrolledCourses.length}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center">
+              <Award className="mr-2 h-4 w-4" />
+              Completed
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">{learner.completedCourses.length}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center">
+              <Calendar className="mr-2 h-4 w-4" />
+              Avg Progress
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">{avgProgress}%</p>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Tabs defaultValue="enrollments" className="space-y-4">
+        <TabsList>
+          <TabsTrigger value="enrollments">Enrollments</TabsTrigger>
+          <TabsTrigger value="progress">Progress</TabsTrigger>
+          <TabsTrigger value="purchases">Purchases</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="enrollments" className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Enrolled Courses</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {enrolledCourses.length > 0 ? (
+                <div className="space-y-4">
+                  {enrolledCourses.map((course) => {
+                    const isCompleted = completedCourses.some(c => c.id === course.id)
+                    return (
+                      <div key={course.id} className="flex items-center justify-between p-4 border rounded-lg">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2">
+                            <h3 className="font-semibold">{course.title}</h3>
+                            {isCompleted && (
+                              <Badge variant="secondary" className="bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200">
+                                Completed
+                              </Badge>
+                            )}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-4">
+                          <Link href={`/admin/courses/preview/${createCourseSlug(course.title, course.id)}`}>
+                            <Button variant="outline" size="sm">
+                              View Course
+                            </Button>
+                          </Link>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <p className="text-center py-8 text-muted-foreground">No enrolled courses</p>
+              )}
+            </CardContent>
+          </Card>
+          
+          {completedCourses.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Award className="h-5 w-5" />
+                  Completed Courses
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-4">
+                  {completedCourses.map((course) => {
+                    return (
+                      <div key={course.id} className="flex items-center justify-between p-4 border rounded-lg bg-purple-50 dark:bg-purple-950/20">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2">
+                            <h3 className="font-semibold">{course.title}</h3>
+                            <Badge variant="secondary" className="bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200">
+                              Completed
+                            </Badge>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-4">
+                          <Link href={`/admin/courses/preview/${createCourseSlug(course.title, course.id)}`}>
+                            <Button variant="outline" size="sm">
+                              View Course
+                            </Button>
+                          </Link>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </TabsContent>
+
+        <TabsContent value="progress" className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Course Progress</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {learner.enrolledCourses.length > 0 ? (
+                <div className="space-y-4">
+                  {learner.enrolledCourses.map((courseId) => {
+                    const course = getCourse(courseId)
+                    const progress = course?.calculatedProgress || 0
+                    if (!course) return null
+                    return (
+                      <div key={courseId} className="space-y-2">
+                        <div className="flex justify-between items-center">
+                          <span className="font-medium">{course.title}</span>
+                          <span className="text-sm text-muted-foreground">{progress}%</span>
+                        </div>
+                        <Progress value={progress} />
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <p className="text-center py-8 text-muted-foreground">No progress data</p>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="purchases" className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <ShoppingBag className="h-5 w-5" />
+                Purchase History ({purchases.length})
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {purchases.length > 0 ? (
+                <div className="space-y-4">
+                  {purchases.map((purchase) => {
+                    const course = getCourse(purchase.courseId)
+                    const isActive = purchase.status === "completed" || purchase.status === "active"
+
+                    return (
+                      <Card key={purchase.id}>
+                        <CardContent className="p-6">
+                          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                            <div className="flex-1">
+                              <div className="flex items-start justify-between mb-2">
+                                <div>
+                                  <h3 className="font-semibold text-lg mb-1">{purchase.courseTitle}</h3>
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <Badge variant="outline" className="bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200">
+                                      One-time Purchase
+                                    </Badge>
+                                    <Badge
+                                      variant={isActive ? "default" : "secondary"}
+                                      className={
+                                        isActive
+                                          ? "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200"
+                                          : "bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-200"
+                                      }
+                                    >
+                                      {isActive ? "Completed" : purchase.status}
+                                    </Badge>
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="space-y-2 text-sm text-muted-foreground mt-3">
+                                <div className="flex items-center gap-2">
+                                  <DollarSign className="h-4 w-4" />
+                                  <span>
+                                    {formatCurrency(purchase.amount, purchase.currency || "USD")}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <Calendar className="h-4 w-4" />
+                                  <span>
+                                    Purchased: {new Date(purchase.purchasedAt).toLocaleDateString("en-US", {
+                                      year: "numeric",
+                                      month: "long",
+                                      day: "numeric",
+                                    })}
+                                  </span>
+                                </div>
+                                {purchase.cancelledAt && (
+                                  <div className="flex items-center gap-2">
+                                    <XCircle className="h-4 w-4" />
+                                    <span>
+                                      Cancelled: {new Date(purchase.cancelledAt).toLocaleDateString("en-US", {
+                                        year: "numeric",
+                                        month: "long",
+                                        day: "numeric",
+                                      })}
+                                    </span>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex flex-col gap-2 md:items-end">
+                              {course && (
+                                <Link href={`/admin/courses/preview/${createCourseSlug(course.title, course.id)}`}>
+                                  <Button variant="outline" size="sm">
+                                    View Course
+                                  </Button>
+                                </Link>
+                              )}
+                            </div>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="text-center py-8 text-muted-foreground">
+                  <ShoppingBag className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                  <p>No purchases found for this learner.</p>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+    </div>
+  )
+}
+
+export default LearnerDetailsPage

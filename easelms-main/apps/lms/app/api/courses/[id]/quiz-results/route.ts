@@ -1,0 +1,668 @@
+import { NextResponse } from "next/server"
+import { extractIdFromSlug } from "@/lib/slug"
+import { logError, logWarning, logInfo, createErrorResponse } from "@/lib/utils/errorHandler"
+
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { createClient, createServiceRoleClient } = await import("@/lib/supabase/server")
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+  }
+
+  // Await params since it's a Promise in Next.js 16
+  const { id } = await params
+  // Extract actual ID from slug (handles both "course-title-123" and "123" formats)
+  const idStr = extractIdFromSlug(id)
+  const courseId = parseInt(idStr, 10)
+  
+  if (isNaN(courseId)) {
+    return NextResponse.json({ error: "Invalid course ID format" }, { status: 400 })
+  }
+
+  logInfo("Quiz results GET", { userId: user.id, courseId })
+
+  // Use service role to bypass RLS and get quiz results
+  const serviceSupabase = createServiceRoleClient()
+
+  // Get quiz results for this user and course
+  // Include shuffle data (denormalized) for instant display
+  const { data: quizResults, error } = await serviceSupabase
+    .from("quiz_results")
+    .select("*")
+    .eq("user_id", user.id)
+    .eq("course_id", courseId)
+    .order("created_at", { ascending: false })
+
+  if (error) {
+    logError("Error fetching quiz results", error, {
+      component: "courses/[id]/quiz-results/route",
+      action: "GET",
+      userId: user.id,
+      courseId,
+    })
+    return NextResponse.json(createErrorResponse(error, 500, { userId: user.id, courseId }), { status: 500 })
+  }
+
+  // Return results grouped by lesson with shuffle data included
+  const resultsByLesson: { [lessonId: number]: any[] } = {}
+  if (quizResults) {
+    quizResults.forEach((result: any) => {
+      if (!resultsByLesson[result.lesson_id]) {
+        resultsByLesson[result.lesson_id] = []
+      }
+      // Include shuffle data in each result for instant display
+      resultsByLesson[result.lesson_id].push({
+        ...result,
+        shuffled_question_order: result.shuffled_question_order || null,
+        shuffled_answer_orders: result.shuffled_answer_orders || null,
+        attempt_id: result.attempt_id || null,
+      })
+    })
+  }
+
+  return NextResponse.json({
+    results: quizResults || [],
+    resultsByLesson: resultsByLesson,
+  })
+}
+
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { createClient, createServiceRoleClient } = await import("@/lib/supabase/server")
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+  }
+
+  // Await params since it's a Promise in Next.js 16
+  const { id } = await params
+  // Extract actual ID from slug (handles both "course-title-123" and "123" formats)
+  const idStr = extractIdFromSlug(id)
+  const courseId = parseInt(idStr, 10)
+  
+  if (isNaN(courseId)) {
+    return NextResponse.json({ error: "Invalid course ID format" }, { status: 400 })
+  }
+
+  logInfo("Quiz results POST", { userId: user.id, courseId, paramsId: id })
+
+  // Check if user is enrolled in the course
+  const { data: enrollment, error: enrollmentError } = await supabase
+    .from("enrollments")
+    .select("status")
+    .eq("user_id", user.id)
+    .eq("course_id", courseId)
+    .single()
+
+  logInfo("Enrollment check", { enrollment: !!enrollment, error: enrollmentError?.message })
+
+  if (!enrollment) {
+    return NextResponse.json(
+      { error: "You must be enrolled in this course to submit quiz results" },
+      { status: 403 }
+    )
+  }
+
+  const body = await request.json()
+  const { lessonId, answers } = body // answers is array of { questionId, userAnswer }
+
+  if (!lessonId || !Array.isArray(answers) || answers.length === 0) {
+    return NextResponse.json(
+      { error: "Invalid request: lessonId and answers array are required" },
+      { status: 400 }
+    )
+  }
+
+  try {
+    // Use service role client to bypass RLS policies for fetching lesson
+    const serviceSupabase = createServiceRoleClient()
+    
+    // Fetch quiz questions from quiz_questions table (preferred)
+    const { data: dbQuestions, error: questionsError } = await serviceSupabase
+      .from("quiz_questions")
+      .select("*")
+      .eq("lesson_id", lessonId)
+      .order("order_index", { ascending: true })
+
+    let quizQuestions: any[] = []
+
+    if (dbQuestions && dbQuestions.length > 0) {
+      // Transform database questions to match frontend format
+      quizQuestions = dbQuestions.map((q: any) => {
+        const questionData = q.question_data || {}
+        let options: string[] = []
+        let correctOption: any = 0
+        
+        if (q.question_type === "multiple-choice") {
+          options = questionData.options || []
+          correctOption = questionData.correctOption ?? 0
+        } else if (q.question_type === "true-false") {
+          options = ["True", "False"]
+          correctOption = questionData.correctAnswer === false ? 1 : 0
+        } else if (q.question_type === "fill-blank") {
+          options = questionData.correctAnswers || []
+          correctOption = 0
+        } else if (q.question_type === "short-answer") {
+          options = questionData.correctKeywords || []
+          correctOption = 0
+        } else if (q.question_type === "essay") {
+          options = []
+          correctOption = -1
+        } else if (q.question_type === "matching") {
+          options = []
+          correctOption = 0
+        }
+        
+        return {
+          id: q.id.toString(), // Use database ID as string for matching
+          dbId: q.id, // Keep integer ID for foreign key
+          type: q.question_type,
+          text: q.question_text,
+          options: options,
+          correctOption: correctOption,
+          correct_answer: correctOption,
+          points: q.points || 1,
+          imageUrl: q.image_url,
+          explanation: q.explanation,
+          difficulty: q.difficulty,
+          timeLimit: q.time_limit,
+          // Include type-specific data
+          ...questionData,
+        }
+      })
+      
+      logInfo("Fetched quiz questions from table", { count: quizQuestions.length, lessonId })
+    } else {
+      // NO JSONB fallback - only use normalized quiz_questions table
+      // If no questions found in table, quiz is empty
+      quizQuestions = []
+      logInfo("No quiz questions found in normalized table for lesson", { lessonId })
+    }
+    
+    logInfo("Received answers", { answersCount: answers.length, lessonId })
+    logInfo("Question IDs in quiz", { questionIds: quizQuestions.map((q: any) => ({ id: q.id, dbId: q.dbId, type: typeof q.id })) })
+
+    // Fetch quiz settings to check if shuffle is enabled
+    const { data: quizSettingsData } = await serviceSupabase
+      .from("quiz_settings")
+      .select("shuffle_quiz, max_attempts")
+      .eq("lesson_id", lessonId)
+      .single()
+
+    const shuffleEnabled = quizSettingsData?.shuffle_quiz || false
+    const maxAttempts = quizSettingsData?.max_attempts || 3
+
+    // Fetch quiz attempt to get shuffle mapping
+    // Use .maybeSingle() instead of .single() to handle case where no attempt exists yet
+    const { data: quizAttempt, error: attemptFetchError } = await serviceSupabase
+      .from("quiz_attempts")
+      .select("*")
+      .eq("user_id", user.id)
+      .eq("lesson_id", lessonId)
+      .order("attempt_number", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    if (attemptFetchError && attemptFetchError.code !== 'PGRST116') {
+      // PGRST116 = no rows returned (expected if no attempt exists)
+      logWarning("Error fetching quiz attempt", {
+        component: "courses/[id]/quiz-results/route",
+        action: "POST",
+        error: attemptFetchError,
+        lessonId,
+      })
+    }
+
+    const hasShuffle = quizAttempt && quizAttempt.question_order && Array.isArray(quizAttempt.question_order) && quizAttempt.question_order.length > 0
+    const questionOrder = hasShuffle ? quizAttempt.question_order : null
+    // Note: answerOrders is no longer used - answers are NOT shuffled, only questions are
+    let attemptId = quizAttempt?.id || null
+    let attemptNumber = quizAttempt?.attempt_number || 1
+    
+    // First, if there's an existing attempt that's not completed, mark it as completed
+    // This ensures we update the existing attempt before creating a new one
+    if (attemptId && quizAttempt && !quizAttempt.completed_at) {
+      const { data: updatedAttempt, error: updateAttemptError } = await serviceSupabase
+        .from("quiz_attempts")
+        .update({ completed_at: new Date().toISOString() })
+        .eq("id", attemptId)
+        .select()
+        .single()
+      
+      if (updateAttemptError) {
+        logWarning("Could not mark quiz attempt as completed before retry", {
+          component: "courses/[id]/quiz-results/route",
+          action: "POST",
+          error: updateAttemptError,
+          attemptId,
+        })
+      } else {
+        logInfo("Quiz attempt marked as completed before retry", { attemptId, lessonId })
+        // Update quizAttempt to reflect completion
+        quizAttempt.completed_at = updatedAttempt?.completed_at || new Date().toISOString()
+      }
+    }
+    
+    // Determine if this is a retry (previous attempt was completed)
+    const isRetry = quizAttempt && quizAttempt.completed_at
+    
+    // Handle retry: create new attempt if previous was completed and we haven't exceeded maxAttempts
+    if (isRetry) {
+      const nextAttemptNumber = (quizAttempt.attempt_number || 0) + 1
+      if (nextAttemptNumber <= maxAttempts) {
+        // Create new attempt for retry
+        attemptNumber = nextAttemptNumber
+        
+        // Generate shuffle for new attempt if shuffle is enabled
+        let newQuestionOrder: number[] | null = null
+        let newAnswerOrders: { [key: string]: number[] } = {}
+        
+        if (shuffleEnabled && quizQuestions.length > 0) {
+          const { shuffleQuiz, generateSeed } = await import("@/lib/quiz/shuffle")
+          const seed = generateSeed(user.id, lessonId, attemptNumber)
+          const shuffleResult = shuffleQuiz(quizQuestions, seed)
+          newQuestionOrder = shuffleResult.questionOrder
+          newAnswerOrders = shuffleResult.answerOrders
+        } else {
+          // No shuffle - use original order
+          newQuestionOrder = quizQuestions.map((q: any) => q.dbId || parseInt(String(q.id)) || 0)
+        }
+        
+        const { data: newAttempt, error: createError } = await serviceSupabase
+          .from("quiz_attempts")
+          .insert({
+            user_id: user.id,
+            lesson_id: lessonId,
+            course_id: courseId,
+            attempt_number: attemptNumber,
+            question_order: newQuestionOrder,
+            answer_orders: newAnswerOrders,
+            completed_at: null, // Will be set when quiz is submitted
+          })
+          .select()
+          .single()
+        
+        if (createError) {
+          logError("Error creating new attempt for retry", createError, {
+            component: "courses/[id]/quiz-results/route",
+            action: "POST",
+            lessonId,
+            attemptNumber,
+          })
+          // Continue with existing attempt if creation fails
+        } else if (newAttempt) {
+          attemptId = newAttempt.id
+          logInfo("New quiz attempt created for retry", {
+            attemptId: newAttempt.id,
+            attemptNumber,
+            lessonId,
+          })
+        }
+      } else {
+        // Max attempts exceeded - reuse last attempt
+        attemptNumber = quizAttempt.attempt_number || maxAttempts
+        logInfo("Max attempts exceeded, reusing last attempt", {
+          attemptId: quizAttempt.id,
+          attemptNumber,
+          maxAttempts,
+          lessonId,
+        })
+      }
+    } else if (!quizAttempt && shuffleEnabled && quizQuestions.length > 0) {
+      // No existing attempt and shuffle is enabled - create first attempt
+      const { shuffleQuiz, generateSeed } = await import("@/lib/quiz/shuffle")
+      const seed = generateSeed(user.id, lessonId, 1)
+      const shuffleResult = shuffleQuiz(quizQuestions, seed)
+      
+      const { data: newAttempt, error: createError } = await serviceSupabase
+        .from("quiz_attempts")
+        .insert({
+          user_id: user.id,
+          lesson_id: lessonId,
+          course_id: courseId,
+          attempt_number: 1,
+          question_order: shuffleResult.questionOrder,
+          answer_orders: shuffleResult.answerOrders,
+          completed_at: null, // Will be set when quiz is submitted
+        })
+        .select()
+        .single()
+      
+      if (createError) {
+        logError("Error creating first quiz attempt", createError, {
+          component: "courses/[id]/quiz-results/route",
+          action: "POST",
+          lessonId,
+        })
+        // Continue without attempt if creation fails
+      } else if (newAttempt) {
+        attemptId = newAttempt.id
+        attemptNumber = 1
+        logInfo("First quiz attempt created", {
+          attemptId: newAttempt.id,
+          lessonId,
+        })
+      }
+    }
+    
+    // If attempt exists but is not completed (and we didn't already mark it as completed above), mark it as completed now
+    // This handles the case where we didn't create a new attempt (not a retry)
+    if (attemptId && quizAttempt && !quizAttempt.completed_at && !isRetry) {
+      const { data: updatedAttempt, error: updateAttemptError } = await serviceSupabase
+        .from("quiz_attempts")
+        .update({ completed_at: new Date().toISOString() })
+        .eq("id", attemptId)
+        .select()
+        .single()
+      
+      if (updateAttemptError) {
+        logWarning("Could not mark quiz attempt as completed", {
+          component: "courses/[id]/quiz-results/route",
+          action: "POST",
+          error: updateAttemptError,
+          attemptId,
+        })
+      } else {
+        logInfo("Quiz attempt marked as completed", { attemptId, lessonId })
+        attemptId = updatedAttempt?.id || attemptId
+      }
+    } else if (attemptId && !quizAttempt) {
+      // New attempt was just created - mark it as completed
+      const { data: updatedAttempt, error: updateAttemptError } = await serviceSupabase
+        .from("quiz_attempts")
+        .update({ completed_at: new Date().toISOString() })
+        .eq("id", attemptId)
+        .select()
+        .single()
+      
+      if (updateAttemptError) {
+        logWarning("Could not mark new quiz attempt as completed", {
+          component: "courses/[id]/quiz-results/route",
+          action: "POST",
+          error: updateAttemptError,
+          attemptId,
+        })
+      } else {
+        logInfo("New quiz attempt marked as completed", { attemptId, lessonId })
+        attemptId = updatedAttempt?.id || attemptId
+      }
+    }
+    
+    // Get final question order (from newly created attempt if needed)
+    let finalQuestionOrder = questionOrder
+    if (attemptId && !hasShuffle && shuffleEnabled && quizQuestions.length > 0) {
+      const { data: attemptData } = await serviceSupabase
+        .from("quiz_attempts")
+        .select("question_order")
+        .eq("id", attemptId)
+        .single()
+      if (attemptData?.question_order) {
+        finalQuestionOrder = attemptData.question_order
+      }
+    }
+
+    // If shuffled, we need to reconstruct the shuffled questions that user saw
+    // NOTE: Only questions are shuffled, NOT answers - answers stay in original order
+    let shuffledQuestionsForComparison: any[] = quizQuestions
+    let originalQuestions: any[] = quizQuestions
+    
+    const effectiveQuestionOrder = finalQuestionOrder
+    const effectiveHasShuffle = effectiveQuestionOrder && Array.isArray(effectiveQuestionOrder) && effectiveQuestionOrder.length > 0
+    
+    if (effectiveHasShuffle && effectiveQuestionOrder) {
+      // Reconstruct question order (questions are shuffled, but answers within each question are NOT)
+      const questionMap = new Map(quizQuestions.map((q: any) => [q.dbId || parseInt(String(q.id)) || 0, q]))
+      originalQuestions = effectiveQuestionOrder.map((originalId: number) => questionMap.get(originalId)).filter(Boolean)
+      
+      // Questions are in shuffled order, but answers within each question are NOT shuffled
+      // So we just reorder the questions, keeping their original options and correctOption
+      shuffledQuestionsForComparison = originalQuestions
+    }
+
+    // Process and save each answer
+    const resultsToInsert = []
+    let correctCount = 0
+    let totalPoints = 0
+    let pointsEarned = 0
+
+    for (let i = 0; i < answers.length; i++) {
+      const answer = answers[i]
+      let question = null
+      let originalQuestion: any = null
+      
+      // Always try to match by questionId first (more reliable than index)
+      // This works for both shuffled and non-shuffled quizzes
+      question = quizQuestions.find((q: any) => {
+        const qId = q.dbId || parseInt(String(q.id)) || 0
+        const answerQuestionId = parseInt(String(answer.questionId)) || 0
+        return qId === answerQuestionId || 
+               String(q.id) === String(answer.questionId) ||
+               q.id?.toString() === answer.questionId?.toString()
+      })
+      
+      if (question) {
+        // Found by ID - this is the original question
+        originalQuestion = question
+        
+        // If shuffled, we need to verify this question is in the shuffled order
+        // and get its position for correct answer comparison
+        if (effectiveHasShuffle && effectiveQuestionOrder) {
+          const questionDbId = question.dbId || parseInt(String(question.id)) || 0
+          const shuffledIndex = effectiveQuestionOrder.findIndex((id: number) => id === questionDbId)
+          if (shuffledIndex >= 0 && shuffledIndex < shuffledQuestionsForComparison.length) {
+            // Use the question from shuffled order for correct answer comparison
+            question = shuffledQuestionsForComparison[shuffledIndex]
+          }
+        }
+      } else {
+        // Not found by ID - fallback to index-based matching (for backward compatibility)
+        if (effectiveHasShuffle && effectiveQuestionOrder && i < effectiveQuestionOrder.length && i < shuffledQuestionsForComparison.length) {
+          // Question at index i in shuffled order
+          question = shuffledQuestionsForComparison[i]
+          const shuffledQuestionId = effectiveQuestionOrder[i]
+          originalQuestion = quizQuestions.find((q: any) => {
+            const qId = q.dbId || parseInt(String(q.id)) || 0
+            return qId === shuffledQuestionId
+          }) || question
+        } else {
+          // Not shuffled, use index fallback
+          if (i < quizQuestions.length) {
+            logInfo(`Question ID ${answer.questionId} not found, using index ${i} as fallback`, { questionId: answer.questionId, index: i })
+            question = quizQuestions[i]
+            originalQuestion = question
+          }
+        }
+      }
+      
+      if (!question) {
+        logError(`Question not found for answer ${i}`, new Error("Question not found"), {
+          component: "courses/[id]/quiz-results/route",
+          action: "POST",
+          answerIndex: i,
+          answer,
+          availableQuestions: quizQuestions.length,
+        })
+        continue
+      }
+      
+      // Use original question for getting question ID and other metadata
+      const questionForMetadata = originalQuestion || question
+
+      // Determine if answer is correct based on question type
+      // Note: If shuffled, only questions are shuffled, NOT answers
+      // Answers stay in original order, so we compare directly using original correctOption
+      let isCorrect = false
+      const qType = question.type || "multiple-choice" || "multiple_choice"
+      
+      if (qType === "multiple-choice" || qType === "multiple_choice") {
+        // For multiple choice, compare with correctOption (already in shuffled position if shuffled)
+        const correctAnswer = question.correctOption !== undefined ? question.correctOption : question.correct_answer
+        isCorrect = correctAnswer === answer.userAnswer
+        logInfo(`Question ${i} (multiple-choice)`, { correctAnswer, userAnswer: answer.userAnswer, isCorrect })
+      } else if (qType === "true-false" || qType === "true_false") {
+        const correctAnswer = question.correctOption !== undefined ? question.correctOption : question.correct_answer
+        isCorrect = correctAnswer === answer.userAnswer
+      } else if (qType === "fill-blank" || qType === "fill_blank") {
+        const correctAnswers = Array.isArray(question.correctAnswers)
+          ? question.correctAnswers
+          : (question.correct_answers ? (Array.isArray(question.correct_answers) ? question.correct_answers : [question.correct_answers]) : [])
+        isCorrect = correctAnswers.some(
+          (ca: any) => ca.toString().toLowerCase() === answer.userAnswer?.toString().toLowerCase()
+        )
+      } else if (qType === "short-answer" || qType === "short_answer") {
+        // For short answer, check if user answer contains keywords
+        const correctKeywords = Array.isArray(question.correctKeywords)
+          ? question.correctKeywords
+          : (question.correct_keywords ? (Array.isArray(question.correct_keywords) ? question.correct_keywords : [question.correct_keywords]) : [])
+        const userAnswerLower = answer.userAnswer?.toString().toLowerCase() || ""
+        isCorrect = correctKeywords.some((keyword: any) =>
+          userAnswerLower.includes(keyword.toString().toLowerCase())
+        )
+      } else {
+        // For essay and other types, default to false or handle differently
+        isCorrect = false
+      }
+
+      if (isCorrect) correctCount++
+
+      // Get points from question (default to 1 if not specified)
+      const questionPoints = question.points || 1
+      const earnedPoints = isCorrect ? questionPoints : 0
+      
+      totalPoints += questionPoints
+      pointsEarned += earnedPoints
+
+      // Answers are NOT shuffled - use answer directly (no mapping needed)
+      // Use database ID (integer) for quiz_question_id - required for foreign key
+      const questionDbId = questionForMetadata.dbId || (typeof questionForMetadata.id === 'number' ? questionForMetadata.id : parseInt(String(questionForMetadata.id || answer.questionId)) || null)
+      
+      if (!questionDbId) {
+        logError(`Cannot determine database ID for question`, new Error("Question ID not found"), {
+          component: "courses/[id]/quiz-results/route",
+          action: "POST",
+          questionId: answer.questionId,
+          question: questionForMetadata,
+          answerIndex: i,
+        })
+        continue // Skip this result if we can't determine the question ID
+      }
+      
+      // Convert user_answer to string for storage (database expects text)
+      // Answers are NOT shuffled, so use answer.userAnswer directly
+      const userAnswerText = answer.userAnswer !== null && answer.userAnswer !== undefined 
+        ? String(answer.userAnswer) 
+        : null
+      
+      resultsToInsert.push({
+        user_id: user.id,
+        course_id: courseId,
+        lesson_id: lessonId,
+        quiz_question_id: questionDbId, // Must be integer (foreign key to quiz_questions.id)
+        attempt_id: attemptId, // Reference to quiz_attempts
+        shuffled_question_order: hasShuffle && questionOrder ? questionOrder : null, // Denormalized for instant display
+        shuffled_answer_orders: null, // Answers are NOT shuffled - always null
+        user_answer: userAnswerText, // Mapped back to original position, stored as text
+        is_correct: isCorrect,
+        score: earnedPoints,
+      })
+    }
+
+    // Delete existing quiz results for this user+lesson to avoid duplicates on retake
+    const { error: deleteError } = await serviceSupabase
+      .from("quiz_results")
+      .delete()
+      .eq("user_id", user.id)
+      .eq("lesson_id", lessonId)
+
+    if (deleteError) {
+      logWarning("Could not delete old quiz results", {
+        component: "courses/[id]/quiz-results/route",
+        action: "POST",
+        error: deleteError,
+        lessonId,
+      })
+    } else {
+      logInfo("Deleted previous quiz results for this lesson", { lessonId })
+    }
+
+    // Insert all quiz results using service role to bypass RLS
+    if (resultsToInsert.length === 0) {
+      logWarning("No quiz results to insert - all questions may have been skipped", {
+        component: "courses/[id]/quiz-results/route",
+        action: "POST",
+        lessonId,
+      })
+      return NextResponse.json({
+        error: "No valid quiz results to save",
+        message: "Could not process quiz answers"
+      }, { status: 400 })
+    }
+
+    const { data: insertedResults, error: insertError } = await serviceSupabase
+      .from("quiz_results")
+      .insert(resultsToInsert)
+      .select()
+
+    if (insertError) {
+      logError("Error inserting quiz results", insertError, {
+        component: "courses/[id]/quiz-results/route",
+        action: "POST",
+        lessonId,
+        resultsCount: resultsToInsert.length,
+        details: insertError.details,
+        hint: insertError.hint,
+        code: insertError.code,
+        resultsToInsertCount: resultsToInsert.length,
+        firstResult: resultsToInsert[0],
+      })
+      return NextResponse.json({
+        error: "Failed to save quiz results",
+        message: insertError.message || "Database error occurred",
+        details: insertError.details,
+      }, { status: 500 })
+    } else {
+      logInfo("Quiz results saved successfully", {
+        recordsCount: insertedResults?.length || 0,
+        lessonId: lessonId,
+        courseId: courseId,
+        userId: user.id,
+      })
+    }
+
+    // Calculate overall score based on points
+    const totalQuestions = answers.length
+    const overallScore = totalPoints > 0 ? (pointsEarned / totalPoints) * 100 : 0
+
+    return NextResponse.json({
+      message: "Quiz completed successfully",
+      results: insertedResults || [],
+      stats: {
+        totalQuestions,
+        correctAnswers: correctCount,
+        incorrectAnswers: totalQuestions - correctCount,
+        totalPoints,
+        pointsEarned,
+        overallScore: Math.round(overallScore * 100) / 100,
+      },
+    })
+  } catch (error: any) {
+    logError("Error processing quiz results", error, {
+      component: "courses/[id]/quiz-results/route",
+      action: "POST",
+    })
+    return NextResponse.json(
+      createErrorResponse(error, 500, { component: "courses/[id]/quiz-results/route", action: "POST" }),
+      { status: 500 }
+    )
+  }
+}
+

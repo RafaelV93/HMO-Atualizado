@@ -1,0 +1,114 @@
+import { useQuery } from "@tanstack/react-query"
+import { PlatformSettings } from "./useSettings"
+
+// Default brand settings (only used when no data exists at all)
+export const DEFAULT_BRAND_SETTINGS = {
+  platformName: "EaseLMS",
+  platformDescription: "EaseLMS is a modern, open-source Learning Management System built with modern tech stack. It provides a complete solution for creating, managing, and delivering online courses with features like video lessons, interactive quizzes, progress tracking, certificates, and payment integration.",
+  logoBlack: "https://cldup.com/VQGhFU5kd6.svg",
+  logoWhite: "https://cldup.com/bwlFqC4f8I.svg",
+  favicon: "https://cldup.com/6yEKvPtX22.svg",
+}
+
+export interface BrandSettings {
+  platformName: string
+  platformDescription: string
+  logoBlack: string
+  logoWhite: string
+  favicon: string
+  seoTitle?: string
+  seoDescription?: string
+  seoKeywords?: string
+  seoImage?: string
+}
+
+// Hook to get brand settings
+// NEVER shows defaults until we've confirmed from database that no custom branding exists
+// If data is loading or pending, return empty strings to prevent default flash
+export function useBrandSettings(): BrandSettings & { isLoading: boolean; hasData: boolean } {
+  const { data, isPending } = useQuery<{ platformSettings: PlatformSettings | null }>({
+    queryKey: ["settings"],
+    queryFn: async () => {
+      try {
+        // Try public brand settings endpoint first (works on auth pages)
+        const publicResponse = await fetch("/api/brand-settings")
+        if (publicResponse.ok) {
+          return await publicResponse.json()
+        }
+        // Fallback to authenticated endpoint if public fails
+        const response = await fetch("/api/settings")
+        if (!response.ok) {
+          return { platformSettings: null }
+        }
+        return response.json()
+      } catch (error) {
+        // If fetch fails, return null - this means we've checked and found nothing
+        return { platformSettings: null }
+      }
+    },
+    staleTime: Infinity, // Never consider data stale - brand settings don't change often
+    gcTime: Infinity, // Keep cache forever - once loaded, always use it
+    placeholderData: (previousData) => previousData, // Always use cached data if available
+    refetchOnMount: false, // Don't refetch on mount if we have cached data
+    refetchOnWindowFocus: false, // Don't refetch on window focus
+    refetchOnReconnect: false, // Don't refetch on reconnect
+  })
+
+  const platformSettings = data?.platformSettings
+  
+  // Check if we have confirmed data from database (even if null)
+  // isPending means we're still fetching, so we haven't confirmed yet
+  const hasConfirmedData = data !== undefined && !isPending
+  
+  // Check if ANY custom brand setting has been set
+  // Only check this if we have confirmed data
+  const hasCustomBranding = hasConfirmedData && platformSettings && !!(
+    platformSettings.platform_name ||
+    platformSettings.logo_black ||
+    platformSettings.logo_white ||
+    platformSettings.favicon ||
+    platformSettings.seo_title ||
+    platformSettings.seo_description ||
+    platformSettings.seo_keywords ||
+    platformSettings.seo_image
+  )
+  
+  // Helper to get value: 
+  // - If data is still loading (not confirmed), return empty string (no defaults)
+  // - If custom branding exists, use custom value
+  // - If we've confirmed no custom branding exists, use default
+  const getValue = (customValue: string | null | undefined, defaultValue: string): string => {
+    // If we haven't confirmed data yet, return empty string to prevent default flash
+    if (!hasConfirmedData) {
+      return ""
+    }
+    
+    // If custom branding exists and we have a custom value, use it
+    if (hasCustomBranding && customValue) {
+      return customValue
+    }
+    
+    // If we've confirmed no custom branding exists, use default
+    // This only happens when platformSettings is null or all fields are null/empty
+    if (hasConfirmedData && !hasCustomBranding) {
+      return defaultValue
+    }
+    
+    // Fallback: if custom branding exists but value is empty, return empty (don't use default)
+    return ""
+  }
+  
+  return {
+    platformName: getValue(platformSettings?.platform_name, DEFAULT_BRAND_SETTINGS.platformName),
+    platformDescription: getValue(platformSettings?.platform_description, DEFAULT_BRAND_SETTINGS.platformDescription),
+    logoBlack: getValue(platformSettings?.logo_black, DEFAULT_BRAND_SETTINGS.logoBlack),
+    logoWhite: getValue(platformSettings?.logo_white, DEFAULT_BRAND_SETTINGS.logoWhite),
+    favicon: getValue(platformSettings?.favicon, DEFAULT_BRAND_SETTINGS.favicon),
+    seoTitle: platformSettings?.seo_title || undefined,
+    seoDescription: platformSettings?.seo_description || undefined,
+    seoKeywords: platformSettings?.seo_keywords || undefined,
+    seoImage: platformSettings?.seo_image || undefined,
+    isLoading: isPending,
+    hasData: hasConfirmedData,
+  }
+}
