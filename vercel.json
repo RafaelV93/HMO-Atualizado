@@ -12,15 +12,15 @@
   },
   "rewrites": [
     {
-      "source": "/((?!api/).*)",
-      "destination": {
-        "service": "website"
-      }
-    },
-    {
       "source": "/app/(.*)",
       "destination": {
         "service": "lms"
+      }
+    },
+    {
+      "source": "/((?!api/).*)",
+      "destination": {
+        "service": "website"
       }
     }
   ]
